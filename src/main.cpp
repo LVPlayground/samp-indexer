@@ -4,6 +4,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <queue>
 #include <stdint.h>
 #include <string>
 #include <utility>
@@ -37,6 +39,32 @@ struct IndexOptions {
 
 // Definition for a server entry, which exists of an IP address and a port number.
 using ServerEntry = std::pair<std::string, uint16_t>;
+
+// Structure containing the information that can be queried from the server.
+struct ServerInfo {
+  explicit ServerInfo(const ServerEntry& server)
+      : server(server) {}
+
+  ServerEntry server;
+
+  bool has_password = false;
+
+  uint16_t players = 0;
+  uint16_t max_players = 0;
+
+  std::string hostname;
+  std::string gamemode;
+  std::string map;
+};
+
+// Queue and vector used for processing the identified ServerEntries.
+std::queue<ServerEntry> server_queue;
+
+std::vector<ServerEntry> failure_vector;
+std::vector<ServerInfo> result_vector;
+
+// Mutexes that protect the aforementioned queue and vector.
+std::mutex server_queue_mutex, result_mutex;
 
 // Parses the command line arguments (|argc| and |argv|) in to the IndexOptions (|options|).
 bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
@@ -80,7 +108,7 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
 
 // Fetches and parses a list of servers from the specified |options.server_list|. Synchronous.
 // Supports HTTP (non-HTTPS) URLs, as well as file paths relative to the CHDIR.
-bool FetchServerList(std::vector<ServerEntry>* servers, const IndexOptions& options) {
+bool FetchServerList(std::queue<ServerEntry>* servers, const IndexOptions& options) {
   const std::string& server_list = options.server_list;
 
   std::vector<std::string> raw_servers;
@@ -192,10 +220,45 @@ bool FetchServerList(std::vector<ServerEntry>* servers, const IndexOptions& opti
       continue;
     }
 
-    servers->emplace_back(line.substr(0, colon_position), port_number);
+    servers->emplace(line.substr(0, colon_position), port_number);
   }
 
   return true;
+}
+
+// Queries the server defined in |info|. Writes the results to |info| as well.
+bool QueryServer(ServerInfo* info) {
+  // TODO: Actually query the server defined in |info|.
+  return false;
+}
+
+// Thread responsible for querying servers. It will pick a ServerEntry from the vector of parsed
+// server entries, query it, and then write the results to the vector of queried servers. Both
+// vectors are protected by mutexes
+void QueryThread() {
+  ServerEntry server;
+
+  while (true) {
+    {
+      std::lock_guard<std::mutex> guard(server_queue_mutex);
+      if (server_queue.empty())
+        return;
+
+      server = server_queue.front();
+      server_queue.pop();
+    }
+
+    ServerInfo info(server);
+
+    const bool success = QueryServer(&info);
+    {
+      std::lock_guard<std::mutex> guard(result_mutex);
+      if (success)
+        result_vector.push_back(std::move(info));
+      else
+        failure_vector.push_back(server);
+    }
+  }
 }
 
 }  // namespace
@@ -208,15 +271,30 @@ int main(int argc, const char** argv) {
   if (options.verbose)
     std::cout << "Parsing servers from '" << options.server_list << "'..." << std::endl;
 
-  std::vector<ServerEntry> servers;
-  if (!FetchServerList(&servers, options))
+  if (!FetchServerList(&server_queue, options))
     return 1;
 
   if (options.verbose)
-    std::cout << "Found " << servers.size() << " servers..." << std::endl;
+    std::cout << "Found " << server_queue.size() << " servers..." << std::endl;
 
-  for (const auto& server : servers)
-    std::cout << "Server: [" << server.first << ":" << server.second << "]" << std::endl;
+  if (!server_queue.size())
+    return 0;  // there are no servers to index
+
+  // Now query all servers in the list in parallel, using |options.threads| threads.
+  {
+    boost::thread_group query_threads;
+    for (size_t i = 0; i < options.threads; ++i)
+      query_threads.create_thread(QueryThread);
+
+    query_threads.join_all();
+  }
+
+  // TODO: Write the results to `logstash` when this has been configured.
+  for (const ServerInfo& info : result_vector)
+    std::cout << info.server.first << ":" << info.server.second << " -- " << info.players << " players";
+
+  for (const ServerEntry& server : failure_vector)
+    std::cout << "Unable to query " << server.first << ":" << server.second << std::endl;
 
   return 0;
 }
