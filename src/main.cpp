@@ -17,16 +17,21 @@
 #include <boost/program_options.hpp>
 #include <boost/thread.hpp>
 
-namespace {
+#if defined(WIN32)
+#include <Windows.h>
+#elif defined(LINUX)
+#include <sys/time.h>
+#include <time.h>
+#endif
 
-// Maximum time, in seconds, we'll wait for a response from a remote server.
-constexpr size_t kSocketTimeoutSeconds = 5;
+namespace {
 
 // Options for the indexer. Sets default values. May be overridden by using the command line flags
 // listed next to each option. {@see ParseCommandLine}
 struct IndexOptions {
   IndexOptions()
       : threads(boost::thread::hardware_concurrency()),
+        timeout(4 /* seconds */),
         user_agent("SAMPIndexer/1.0 (+https://sa-mp.nl/)") {}
 
   ~IndexOptions() = default;
@@ -34,6 +39,7 @@ struct IndexOptions {
   std::string logstash;     // --logstash
   std::string server_list;  // --server-list
   uint32_t threads;         // --threads, -t
+  uint32_t timeout;         // --timeout
   std::string user_agent;   // --user-agent
 
   bool output = true;       // Whether to output the results to stdout.
@@ -62,14 +68,78 @@ struct ServerInfo {
 
 // -------------------------------------------------------------------------------------------------
 
+IndexOptions options;
+
 // Queue and vector used for processing the identified ServerEntries.
 std::queue<ServerEntry> server_queue;
 
 std::vector<ServerEntry> failure_vector;
 std::vector<ServerInfo> result_vector;
 
-// Mutexes that protect the aforementioned queue and vector.
-std::mutex server_queue_mutex, result_mutex, error_mutex;
+// Mutexes that protect the aforementioned queue and vector, as well as verbose output.
+std::mutex server_queue_mutex, result_mutex, verbose_output_mutex;
+
+// -------------------------------------------------------------------------------------------------
+
+std::string ToDisplay(const ServerEntry& server) {
+  return server.first + ":" + std::to_string(server.second);
+}
+
+// -------------------------------------------------------------------------------------------------
+
+#if defined(WIN32)
+
+// Difference between January 1st, 1601 and January 1st, 1970 in nanoseconds, to convert from
+// the Windows file time epoch to the UNIX timestamp epoch.
+const uint64_t kEpochDelta = 116444736000000000ull;
+
+double monotonicallyIncreasingTime() {
+  static uint64_t begin_time = 0ull;
+  static bool set_begin_time = false;
+
+  FILETIME tm;
+
+  // Use precise (<1us) timing for Windows 8 and above, normal (~1ms) on other versions.
+#if defined(NTDDI_WIN8) && NTDDI_VERSION >= NTDDI_WIN8
+  GetSystemTimePreciseAsFileTime(&tm);
+#else
+  GetSystemTimeAsFileTime(&tm);
+#endif
+
+  uint64_t time = 0;
+  time |= tm.dwHighDateTime;
+  time <<= 32;
+  time |= tm.dwLowDateTime;
+  time -= kEpochDelta;
+
+  if (!set_begin_time) {
+    set_begin_time = true;
+    begin_time = time;
+  }
+
+  return static_cast<double>(time - begin_time) / 10000.0;
+}
+
+#elif defined(LINUX)
+
+double monotonicallyIncreasingTime() {
+  static uint64_t begin_time = 0ull;
+  static bool set_begin_time = false;
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  uint64_t time = static_cast<uint64_t>(ts.tv_sec) * 1000000000u + static_cast<uint64_t>(ts.tv_nsec);
+
+  if (!set_begin_time) {
+    set_begin_time = true;
+    begin_time = time;
+  }
+
+  return static_cast<double>(time - begin_time) / 1000000.0;
+}
+
+#endif
 
 // -------------------------------------------------------------------------------------------------
 
@@ -82,6 +152,7 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
       ("logstash", po::value<std::string>(), "Path to the logstash UNIX pipe (instead of STDOUT)")
       ("server-list", po::value<std::string>()->required(), "URL of the server list to use")
       ("threads,t", po::value<uint32_t>(), "Number of threads to use")
+      ("timeout", po::value<uint32_t>(), "Request timeout for an individual server, in seconds")
       ("verbose,v", "Enable verbose output")
       ("user-agent", po::value<std::string>(), "The user agent to use in the request");
 
@@ -115,7 +186,7 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
 
 // Fetches and parses a list of servers from the specified |options.server_list|. Synchronous.
 // Supports HTTP (non-HTTPS) URLs, as well as file paths relative to the CHDIR.
-bool FetchServerList(std::queue<ServerEntry>* servers, const IndexOptions& options) {
+bool FetchServerList(std::queue<ServerEntry>* servers) {
   const std::string& server_list = options.server_list;
 
   std::vector<std::string> raw_servers;
@@ -321,14 +392,13 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
 
     udp::socket socket(io_service);
 
-    // Set send and receive timeouts on the |socket| for |kSocketTimeoutSeconds| seconds.
 #if defined(WIN32)
-    int32_t timeout = kSocketTimeoutSeconds * 1000;
+    uint32_t timeout = options.timeout * 1000;
     setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 #else
     struct timeval tv;
-    tv.tv_sec = kSocketTimeoutSeconds;
+    tv.tv_sec = options.timeout;
     tv.tv_usec = 0;
     setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -339,7 +409,8 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
     boost::array<char, 256> receive_buffer;
 
     // Send the |packet| to the |endpoint| over the opened |socket|.
-    socket.send_to(boost::asio::buffer(packet), endpoint);
+    if (socket.send_to(boost::asio::buffer(packet), endpoint) != sizeof(packet))
+      return false;
 
     size_t bytes = socket.receive_from(boost::asio::buffer(receive_buffer), endpoint);
     size_t offset = 11;  // the |packet| that we sent
@@ -355,8 +426,10 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
            ReadValue(&info->map, receive_buffer, bytes, &offset);
 
   } catch (std::exception& e) {
-    std::lock_guard<std::mutex> guard(error_mutex);
-    std::cerr << "Exception: " << e.what() << std::endl;
+    if (options.verbose) {
+      std::lock_guard<std::mutex> guard(verbose_output_mutex);
+      std::cerr << "[" << ToDisplay(info->server) << "] ERROR: " << e.what() << std::endl;
+    }
     return false;
   }
 
@@ -380,9 +453,24 @@ void QueryThread() {
       server_queue.pop();
     }
 
+    double begin = monotonicallyIncreasingTime();
+
     ServerInfo info(server);
+    if (options.verbose) {
+      std::lock_guard<std::mutex> guard(verbose_output_mutex);
+      std::cout << "[" << ToDisplay(server) << "] Querying the server..." << std::endl;
+    }
 
     const bool success = QueryServer(&info, io_service);
+
+    if (options.verbose) {
+      double delta = monotonicallyIncreasingTime() - begin;
+
+      std::lock_guard<std::mutex> guard(verbose_output_mutex);
+      std::cout << "[" << ToDisplay(server) << "] Finished the query in "
+                << std::setprecision(2) << delta << "ms" << std::endl;
+    }
+
     {
       std::lock_guard<std::mutex> guard(result_mutex);
       if (success)
@@ -398,14 +486,13 @@ void QueryThread() {
 // -------------------------------------------------------------------------------------------------
 
 int main(int argc, const char** argv) {
-  IndexOptions options;
   if (!ParseCommandLine(&options, argc, argv))
     return 1;
 
   if (options.verbose)
     std::cout << "Parsing servers from '" << options.server_list << "'..." << std::endl;
 
-  if (!FetchServerList(&server_queue, options))
+  if (!FetchServerList(&server_queue))
     return 1;
 
   if (options.verbose)
