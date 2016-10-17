@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,15 @@ struct IndexOptions {
 // Definition for a server entry, which exists of an IP address and a port number.
 using ServerEntry = std::pair<std::string, uint16_t>;
 
+// Provides the ability to hash a ServerEntry value, for the retry set.
+struct ServerEntryHasher {
+ public:
+  std::size_t operator()(const ServerEntry& entry) const {
+    return std::hash<std::string>()(entry.first) ^
+           std::hash<uint16_t>()(entry.second);
+  }
+};
+
 // Structure containing the information that can be queried from the server.
 struct ServerInfo {
   explicit ServerInfo(const ServerEntry& server)
@@ -81,6 +91,7 @@ IndexOptions options;
 
 // Queue and vector used for processing the identified ServerEntries.
 std::queue<ServerEntry> server_queue;
+std::unordered_set<ServerEntry, ServerEntryHasher> retry_list;
 
 std::vector<ServerEntry> failure_vector;
 std::vector<ServerInfo> result_vector;
@@ -506,6 +517,14 @@ void QueryThread() {
       std::lock_guard<std::mutex> guard(verbose_output_mutex);
       std::cout << "[" << ToDisplay(server) << "] Finished the query in "
                 << std::setprecision(2) << delta << "ms" << std::endl;
+    }
+
+    if (!success && !retry_list.count(server)) {
+      std::lock_guard<std::mutex> guard(server_queue_mutex);
+
+      retry_list.insert(server);
+      server_queue.push(server);
+      continue;
     }
 
     {
