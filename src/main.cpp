@@ -26,6 +26,14 @@
 
 namespace {
 
+// Verbosity setting for the indexer.
+enum class Verbosity {
+  QUIET,
+  DEFAULT,
+  VERBOSE,
+  DEBUG
+};
+
 // Options for the indexer. Sets default values. May be overridden by using the command line flags
 // listed next to each option. {@see ParseCommandLine}
 struct IndexOptions {
@@ -42,8 +50,7 @@ struct IndexOptions {
   uint32_t timeout;         // --timeout
   std::string user_agent;   // --user-agent
 
-  bool output = true;       // Whether to output the results to stdout.
-  bool verbose = false;     // Whether to output exactly what's happening.
+  Verbosity verbosity = Verbosity::DEBUG;  // -v, -quiet
 };
 
 // Definition for a server entry, which exists of an IP address and a port number.
@@ -147,14 +154,17 @@ double monotonicallyIncreasingTime() {
 bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
   namespace po = boost::program_options;
 
+  uint32_t verbosity = 0;
+
   po::options_description indexer("SA-MP Indexer");
   indexer.add_options()
       ("logstash", po::value<std::string>(), "Path to the logstash UNIX pipe (instead of STDOUT)")
+      ("quiet,q", "Block all output")
       ("server-list", po::value<std::string>()->required(), "URL of the server list to use")
       ("threads,t", po::value<uint32_t>(), "Number of threads to use")
       ("timeout", po::value<uint32_t>(), "Request timeout for an individual server, in seconds")
-      ("verbose,v", "Enable verbose output")
-      ("user-agent", po::value<std::string>(), "The user agent to use in the request");
+      ("user-agent", po::value<std::string>(), "The user agent to use in the request")
+      (",v", po::value<uint32_t>(&verbosity)->implicit_value(0), "Enable verbose output");
 
   po::variables_map variables;
   try {
@@ -167,19 +177,24 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
     return false;
   }
 
-  if (variables.count("logstash")) {
+  if (variables.count("logstash"))
     options->logstash = variables["logstash"].as<std::string>();
-    options->output = false;
-  }
 
   if (variables.count("server-list"))
     options->server_list = variables["server-list"].as<std::string>();
   if (variables.count("threads"))
     options->threads = variables["threads"].as<uint32_t>();
-  if (variables.count("verbose"))
-    options->verbose = true;
   if (variables.count("user-agent"))
     options->user_agent = variables["user-agent"].as<std::string>();
+
+  options->verbosity = Verbosity::DEFAULT;
+
+  if (verbosity == 1)
+    options->verbosity = Verbosity::VERBOSE;
+  else if (verbosity >= 2)
+    options->verbosity = Verbosity::DEBUG;
+  else if (variables.count("quiet"))
+    options->verbosity = Verbosity::QUIET;
 
   return true;
 }
@@ -240,8 +255,11 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
       response_stream >> http_status_code;
       
       if (!response_stream || http_version.substr(0, 5) != "HTTP/" || http_status_code != 200) {
-        std::cerr << "Received an invalid HTTP response (" << http_version << "; "
-                  << http_status_code << ")" << std::endl;
+        if (options.verbosity != Verbosity::QUIET) {
+          std::cerr << "Received an invalid HTTP response (" << http_version << "; "
+                    << http_status_code << ")" << std::endl;
+        }
+
         return false;
       }
 
@@ -263,7 +281,10 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
       socket.close();
     }
     catch (std::exception& e) {
-      std::cerr << "Unable to fetch the server list: " << e.what() << std::endl;
+      if (options.verbosity != Verbosity::QUIET) {
+        std::cerr << "Unable to fetch the server list: " << e.what() << std::endl;
+      }
+
       return false;
     }
   } else {
@@ -277,7 +298,10 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
   }
 
   if (!raw_servers.size()) {
-    std::cerr << "Unable to load the list of servers from: " << server_list;
+    if (options.verbosity != Verbosity::QUIET) {
+      std::cerr << "Unable to load the list of servers from: " << server_list;
+    }
+
     return false;
   }
 
@@ -286,7 +310,10 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
 
     size_t colon_position = line.find_first_of(':');
     if (colon_position == std::string::npos) {
-      std::cerr << "Unable to parse server entry: " << line;
+      if (options.verbosity != Verbosity::QUIET) {
+        std::cerr << "Unable to parse server entry: " << line;
+      }
+
       continue;
     }
 
@@ -294,7 +321,10 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
     try {
       port_number = boost::lexical_cast<uint16_t>(line.substr(colon_position + 1));
     } catch (boost::bad_lexical_cast const&) {
-      std::cerr << "Invalid port number for server entry: " << line;
+      if (options.verbosity != Verbosity::QUIET) {
+        std::cerr << "Invalid port number for server entry: " << line;
+      }
+
       continue;
     }
 
@@ -392,6 +422,8 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
 
     udp::socket socket(io_service);
 
+    socket.open(endpoint.protocol());
+
 #if defined(WIN32)
     uint32_t timeout = options.timeout * 1000;
     setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -403,8 +435,6 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
     setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
-
-    socket.open(endpoint.protocol());
 
     boost::array<char, 256> receive_buffer;
 
@@ -426,7 +456,7 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
            ReadValue(&info->map, receive_buffer, bytes, &offset);
 
   } catch (std::exception& e) {
-    if (options.verbose) {
+    if (options.verbosity == Verbosity::VERBOSE || options.verbosity == Verbosity::DEBUG) {
       std::lock_guard<std::mutex> guard(verbose_output_mutex);
       std::cerr << "[" << ToDisplay(info->server) << "] ERROR: " << e.what() << std::endl;
     }
@@ -453,18 +483,21 @@ void QueryThread() {
       server_queue.pop();
     }
 
-    double begin = monotonicallyIncreasingTime();
-
     ServerInfo info(server);
-    if (options.verbose) {
+
+    double begin = 0;
+
+    if (options.verbosity == Verbosity::DEBUG) {
+      begin = monotonicallyIncreasingTime();
+
       std::lock_guard<std::mutex> guard(verbose_output_mutex);
       std::cout << "[" << ToDisplay(server) << "] Querying the server..." << std::endl;
     }
 
     const bool success = QueryServer(&info, io_service);
 
-    if (options.verbose) {
-      double delta = monotonicallyIncreasingTime() - begin;
+    if (options.verbosity == Verbosity::DEBUG) {
+      long int delta = lround(monotonicallyIncreasingTime() - begin);
 
       std::lock_guard<std::mutex> guard(verbose_output_mutex);
       std::cout << "[" << ToDisplay(server) << "] Finished the query in "
@@ -487,19 +520,22 @@ void QueryThread() {
 
 int main(int argc, const char** argv) {
   if (!ParseCommandLine(&options, argc, argv))
-    return 1;
+    return 1;  // unable to parse the command line
 
-  if (options.verbose)
+  if (options.verbosity == Verbosity::VERBOSE)
     std::cout << "Parsing servers from '" << options.server_list << "'..." << std::endl;
 
   if (!FetchServerList(&server_queue))
-    return 1;
+    return 1;  // unable to fetch the list of servers
 
-  if (options.verbose)
+  if (options.verbosity == Verbosity::VERBOSE)
     std::cout << "Found " << server_queue.size() << " servers..." << std::endl;
 
-  if (!server_queue.size())
-    return 0;  // there are no servers to index
+  const size_t server_count = server_queue.size();
+  if (!server_count)
+    return 1;  // unable to find servers to index
+
+  double begin = monotonicallyIncreasingTime();
 
   // Now query all servers in the list in parallel, using |options.threads| threads.
   {
@@ -510,14 +546,35 @@ int main(int argc, const char** argv) {
     query_threads.join_all();
   }
 
-  // TODO: Write the results to `logstash` when this has been configured.
-  for (const ServerInfo& info : result_vector) {
-    std::cout << info.server.first << ":" << info.server.second << " -- " << info.hostname << " -- "
-              << info.players << " players (" << info.max_players << " max)" << std::endl;
+  long int delta = lround(monotonicallyIncreasingTime() - begin);
+
+  // Output the total time taken for the query sequence when verbose output is enabled.
+  if (options.verbosity != Verbosity::QUIET) {
+    std::cout << "Queried " << server_count << " servers in " << std::setprecision(2) << delta << "ms." << std::endl;
+    std::cout << "Successful: " << result_vector.size() << ". Failed: " << failure_vector.size() << std::endl;
+
+    uint32_t player_count = 0;
+    uint32_t player_slot_count = 0;
+
+    for (const ServerInfo& info : result_vector) {
+      player_count += info.players;
+      player_slot_count += info.max_players;
+    }
+
+    std::cout << "There are " << player_count << " players online, with a capacity of " << player_slot_count << "."
+              << std::endl << std::endl;
   }
 
-  for (const ServerEntry& server : failure_vector)
-    std::cout << "Unable to query " << server.first << ":" << server.second << std::endl;
+  if (!options.logstash.empty()) {
+    // TODO: Write the results to `logstash` when this has been configured.
+  }
 
-  return 0;
+  if (options.verbosity == Verbosity::DEBUG) {
+    for (const ServerInfo& info : result_vector) {
+      std::cout << ToDisplay(info.server) << " -- " << info.players << "/" << info.max_players << " -- ";
+      std::cout << info.hostname << " (" << info.gamemode << ")" << std::endl;
+    }
+  }
+  
+  return 0;  // no errors \o/
 }
