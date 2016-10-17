@@ -19,6 +19,9 @@
 
 namespace {
 
+// Maximum time, in seconds, we'll wait for a response from a remote server.
+constexpr size_t kSocketTimeoutSeconds = 5;
+
 // Options for the indexer. Sets default values. May be overridden by using the command line flags
 // listed next to each option. {@see ParseCommandLine}
 struct IndexOptions {
@@ -57,6 +60,8 @@ struct ServerInfo {
   std::string map;
 };
 
+// -------------------------------------------------------------------------------------------------
+
 // Queue and vector used for processing the identified ServerEntries.
 std::queue<ServerEntry> server_queue;
 
@@ -64,7 +69,9 @@ std::vector<ServerEntry> failure_vector;
 std::vector<ServerInfo> result_vector;
 
 // Mutexes that protect the aforementioned queue and vector.
-std::mutex server_queue_mutex, result_mutex;
+std::mutex server_queue_mutex, result_mutex, error_mutex;
+
+// -------------------------------------------------------------------------------------------------
 
 // Parses the command line arguments (|argc| and |argv|) in to the IndexOptions (|options|).
 bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
@@ -226,16 +233,141 @@ bool FetchServerList(std::queue<ServerEntry>* servers, const IndexOptions& optio
   return true;
 }
 
+// -------------------------------------------------------------------------------------------------
+
+template <typename T>
+bool ReadValue(T* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
+  throw std::exception("Invalid ReadValue() overload reached.");
+}
+
+template <>
+bool ReadValue(bool* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
+  if (*offset + sizeof(bool) > bytes)
+    return false;
+
+  *storage = !!buffer[*offset];
+  *offset += sizeof(bool);
+
+  return true;
+}
+
+template <>
+bool ReadValue(uint16_t* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
+  if (*offset + sizeof(uint16_t) > bytes)
+    return false;
+
+  *storage = static_cast<unsigned char>(buffer[*offset]) |
+             static_cast<unsigned char>(buffer[*offset + 1]) << 8;
+
+  *offset += sizeof(uint16_t);
+
+  return true;
+}
+
+template <>
+bool ReadValue(std::string* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
+  if (*offset + sizeof(uint32_t) > bytes)
+    return false;
+
+  uint32_t length = static_cast<unsigned char>(buffer[*offset]) |
+                    static_cast<unsigned char>(buffer[*offset + 1]) << 8 |
+                    static_cast<unsigned char>(buffer[*offset + 2]) << 16 |
+                    static_cast<unsigned char>(buffer[*offset + 3]) << 24;
+
+  *offset += sizeof(uint32_t);
+
+  if (*offset + length > bytes)
+    return false;
+
+  *storage = std::string(&buffer[*offset], length);
+  *offset += length;
+
+  return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+
 // Queries the server defined in |info|. Writes the results to |info| as well.
-bool QueryServer(ServerInfo* info) {
-  // TODO: Actually query the server defined in |info|.
-  return false;
+bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
+  unsigned char packet[11];
+
+  boost::asio::ip::address_v4 address = boost::asio::ip::address_v4::from_string(info->server.first);
+  unsigned short port = info->server.second;
+
+  // Compile the information in |packet| necessary to query the server.
+  {
+    unsigned long long_address = address.to_ulong();
+    unsigned short port = info->server.second;
+
+    packet[0] = 'S';
+    packet[1] = 'A';
+    packet[2] = 'M';
+    packet[3] = 'P';
+
+    static_assert(sizeof(long_address) == 4, "unsigned long must be four bytes");
+    memcpy(&packet[4], &long_address, sizeof(long_address));
+
+    packet[8] = port & 0xFF;
+    packet[9] = (port >> 8) & 0xFF;
+
+    packet[10] = 'i';  // information packet identifier
+  }
+
+  using boost::asio::ip::udp;
+  try {
+    udp::endpoint endpoint;
+    endpoint.address(address);
+    endpoint.port(port);
+
+    udp::socket socket(io_service);
+
+    // Set send and receive timeouts on the |socket| for |kSocketTimeoutSeconds| seconds.
+#if defined(WIN32)
+    int32_t timeout = kSocketTimeoutSeconds * 1000;
+    setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = kSocketTimeoutSeconds;
+    tv.tv_usec = 0;
+    setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+    socket.open(endpoint.protocol());
+
+    boost::array<char, 256> receive_buffer;
+
+    // Send the |packet| to the |endpoint| over the opened |socket|.
+    socket.send_to(boost::asio::buffer(packet), endpoint);
+
+    size_t bytes = socket.receive_from(boost::asio::buffer(receive_buffer), endpoint);
+    size_t offset = 11;  // the |packet| that we sent
+
+    if (bytes <= offset)
+      throw std::exception("Received packet size too short");
+
+    return ReadValue(&info->has_password, receive_buffer, bytes, &offset) &&
+           ReadValue(&info->players, receive_buffer, bytes, &offset) &&
+           ReadValue(&info->max_players, receive_buffer, bytes, &offset) &&
+           ReadValue(&info->hostname, receive_buffer, bytes, &offset) &&
+           ReadValue(&info->gamemode, receive_buffer, bytes, &offset) &&
+           ReadValue(&info->map, receive_buffer, bytes, &offset);
+
+  } catch (std::exception& e) {
+    std::lock_guard<std::mutex> guard(error_mutex);
+    std::cerr << "Exception: " << e.what() << std::endl;
+    return false;
+  }
+
+  return true;
 }
 
 // Thread responsible for querying servers. It will pick a ServerEntry from the vector of parsed
 // server entries, query it, and then write the results to the vector of queried servers. Both
 // vectors are protected by mutexes
 void QueryThread() {
+  boost::asio::io_service io_service;
   ServerEntry server;
 
   while (true) {
@@ -250,7 +382,7 @@ void QueryThread() {
 
     ServerInfo info(server);
 
-    const bool success = QueryServer(&info);
+    const bool success = QueryServer(&info, io_service);
     {
       std::lock_guard<std::mutex> guard(result_mutex);
       if (success)
@@ -262,6 +394,8 @@ void QueryThread() {
 }
 
 }  // namespace
+
+// -------------------------------------------------------------------------------------------------
 
 int main(int argc, const char** argv) {
   IndexOptions options;
@@ -290,8 +424,10 @@ int main(int argc, const char** argv) {
   }
 
   // TODO: Write the results to `logstash` when this has been configured.
-  for (const ServerInfo& info : result_vector)
-    std::cout << info.server.first << ":" << info.server.second << " -- " << info.players << " players";
+  for (const ServerInfo& info : result_vector) {
+    std::cout << info.server.first << ":" << info.server.second << " -- " << info.hostname << " -- "
+              << info.players << " players (" << info.max_players << " max)" << std::endl;
+  }
 
   for (const ServerEntry& server : failure_vector)
     std::cout << "Unable to query " << server.first << ":" << server.second << std::endl;
