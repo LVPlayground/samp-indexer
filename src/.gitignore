@@ -1,6 +1,7 @@
 .vs/
 out/
 *.filters
+*.opendb
 *.opensdf
 *.sdf
 *.user
