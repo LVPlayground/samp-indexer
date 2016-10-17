@@ -6,6 +6,7 @@
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stdint.h>
 #include <string>
 #include <utility>
@@ -566,7 +567,50 @@ int main(int argc, const char** argv) {
   }
 
   if (!options.logstash.empty()) {
-    // TODO: Write the results to `logstash` when this has been configured.
+#if defined(BOOST_ASIO_HAS_LOCAL_SOCKETS)
+    boost::asio::io_service logstash_io_service;
+    boost::asio::local::stream_protocol::socket logstash_socket(logstash_io_service);
+
+    try {
+      logstash_socket.connect(boost::asio::local::stream_protocol::endpoint(endpoint));
+
+      for (const ServerInfo& info : result_vector) {
+        std::stringstream stream;
+
+        stream << "{";
+        {
+          stream << "\"type\": \"query\",";
+          stream << "\"server\": \"" << info.server.first << ":" << info.server.second << "\",";
+          stream << "\"online\": 1,";
+          stream << "\"players\": " << info.players << ",";
+          stream << "\"max_players\": " << info.max_players;
+        }
+        stream << "}";
+
+        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
+      }
+
+      for (const ServerEntry& server : failure_vector) {
+        std::stringstream stream;
+
+        stream << "{";
+        {
+          stream << "\"type\": \"query\",";
+          stream << "\"server\": \"" << server.first << ":" << server.second << "\",";
+          stream << "\"online\": 0,";
+          stream << "\"players\": 0,";
+          stream << "\"max_players\": 0";
+        }
+        stream << "}";
+
+        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
+      }
+
+    } catch (std::exception& e) {
+      if (options.verbosity != Verbosity::QUIET)
+        std::cerr << "LOGSTASH ERROR: " << e.what() << std::endl;
+    }
+#endif
   }
 
   if (options.verbosity == Verbosity::DEBUG) {
