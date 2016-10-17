@@ -7,6 +7,7 @@
 #include <mutex>
 #include <queue>
 #include <sstream>
+#include <stdexcept>
 #include <stdint.h>
 #include <string>
 #include <utility>
@@ -339,7 +340,7 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
 
 template <typename T>
 bool ReadValue(T* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
-  throw std::exception("Invalid ReadValue() overload reached.");
+  throw std::runtime_error("Invalid ReadValue() overload reached.");
 }
 
 template <>
@@ -398,19 +399,20 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
 
   // Compile the information in |packet| necessary to query the server.
   {
-    unsigned long long_address = address.to_ulong();
-    unsigned short port = info->server.second;
-
     packet[0] = 'S';
     packet[1] = 'A';
     packet[2] = 'M';
     packet[3] = 'P';
 
-    static_assert(sizeof(long_address) == 4, "unsigned long must be four bytes");
-    memcpy(&packet[4], &long_address, sizeof(long_address));
+    auto address_bytes = address.to_bytes();
 
-    packet[8] = port & 0xFF;
-    packet[9] = (port >> 8) & 0xFF;
+    packet[4] = address_bytes[0];
+    packet[5] = address_bytes[1];
+    packet[6] = address_bytes[2];
+    packet[7] = address_bytes[3];
+
+    packet[8] = info->server.second & 0xFF;
+    packet[9] = (info->server.second >> 8) & 0xFF;
 
     packet[10] = 'i';  // information packet identifier
   }
@@ -433,6 +435,7 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
     struct timeval tv;
     tv.tv_sec = options.timeout;
     tv.tv_usec = 0;
+
     setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
@@ -447,7 +450,7 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
     size_t offset = 11;  // the |packet| that we sent
 
     if (bytes <= offset)
-      throw std::exception("Received packet size too short");
+      throw std::runtime_error("Received packet size too short");
 
     return ReadValue(&info->has_password, receive_buffer, bytes, &offset) &&
            ReadValue(&info->players, receive_buffer, bytes, &offset) &&
@@ -572,7 +575,7 @@ int main(int argc, const char** argv) {
     boost::asio::local::stream_protocol::socket logstash_socket(logstash_io_service);
 
     try {
-      logstash_socket.connect(boost::asio::local::stream_protocol::endpoint(endpoint));
+      logstash_socket.connect(boost::asio::local::stream_protocol::endpoint(options.logstash));
 
       for (const ServerInfo& info : result_vector) {
         std::stringstream stream;
