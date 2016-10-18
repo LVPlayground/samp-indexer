@@ -27,6 +27,9 @@
 #include <time.h>
 #endif
 
+using boost::asio::deadline_timer;
+using boost::asio::ip::udp;
+
 namespace {
 
 // Verbosity setting for the indexer.
@@ -349,6 +352,65 @@ bool FetchServerList(std::queue<ServerEntry>* servers) {
 
 // -------------------------------------------------------------------------------------------------
 
+// http://www.boost.org/doc/libs/1_52_0/doc/html/boost_asio/example/timeouts/blocking_udp_client.cpp
+class TimedSocket {
+ public:
+  TimedSocket(boost::asio::io_service& io_service, udp::endpoint& endpoint)
+      : io_service_(io_service),
+        socket_(io_service),
+        deadline_(io_service) {
+    deadline_.expires_at(boost::posix_time::pos_infin);
+    check_deadline();
+
+    socket_.open(endpoint.protocol());
+  }
+
+  std::size_t receive_from(const boost::asio::mutable_buffer& buffer,
+                           udp::endpoint& endpoint,
+                           boost::system::error_code& ec) {
+    deadline_.expires_from_now(boost::posix_time::seconds(options.timeout));
+
+    ec = boost::asio::error::would_block;
+    std::size_t length = 0;
+
+    socket_.async_receive_from(boost::asio::buffer(buffer), endpoint,
+                               boost::bind(&TimedSocket::handle_receive, _1, _2, &ec, &length));
+
+    do {
+      io_service_.run_one();
+
+    } while (ec == boost::asio::error::would_block);
+
+    return length;
+  }
+
+  udp::socket& raw() { return socket_; }
+
+ private:
+  void check_deadline() {
+    if (deadline_.expires_at() <= deadline_timer::traits_type::now()) {
+      socket_.cancel();
+      deadline_.expires_at(boost::posix_time::pos_infin);
+    }
+
+    deadline_.async_wait(boost::bind(&TimedSocket::check_deadline, this));
+  }
+
+  static void handle_receive(const boost::system::error_code& ec,
+                             std::size_t length,
+                             boost::system::error_code* out_ec,
+                             std::size_t* out_length) {
+    *out_ec = ec;
+    *out_length = length;
+  }
+
+  boost::asio::io_service& io_service_;
+  udp::socket socket_;
+  deadline_timer deadline_;
+};
+
+// -------------------------------------------------------------------------------------------------
+
 template <typename T>
 bool ReadValue(T* storage, const boost::array<char, 256>& buffer, const size_t& bytes, size_t* offset) {
   throw std::runtime_error("Invalid ReadValue() overload reached.");
@@ -428,36 +490,27 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
     packet[10] = 'i';  // information packet identifier
   }
 
-  using boost::asio::ip::udp;
   try {
     udp::endpoint endpoint;
     endpoint.address(address);
     endpoint.port(port);
 
-    udp::socket socket(io_service);
+    boost::system::error_code error;
 
-    socket.open(endpoint.protocol());
+    TimedSocket socket(io_service, endpoint);
 
-#if defined(WIN32)
-    uint32_t timeout = options.timeout * 1000;
-    setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-#else
-    struct timeval tv;
-    tv.tv_sec = options.timeout;
-    tv.tv_usec = 0;
-
-    setsockopt(socket.native(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(socket.native(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
+    // Send the |packet| to the |endpoint| over the opened |socket|.
+    if (socket.raw().send_to(boost::asio::buffer(packet), endpoint) != sizeof(packet))
+      return false;
 
     boost::array<char, 256> receive_buffer;
 
-    // Send the |packet| to the |endpoint| over the opened |socket|.
-    if (socket.send_to(boost::asio::buffer(packet), endpoint) != sizeof(packet))
-      return false;
+    size_t bytes = socket.receive_from(boost::asio::buffer(receive_buffer), endpoint, error);
 
-    size_t bytes = socket.receive_from(boost::asio::buffer(receive_buffer), endpoint);
+    if (error == boost::asio::error::operation_not_supported ||
+        error == boost::asio::error::operation_aborted)
+      return false;  // timed out
+
     size_t offset = 11;  // the |packet| that we sent
 
     if (bytes <= offset)
