@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,13 +44,15 @@ enum class Verbosity {
 // listed next to each option. {@see ParseCommandLine}
 struct IndexOptions {
   IndexOptions()
-      : threads(boost::thread::hardware_concurrency()),
-        timeout(4 /* seconds */),
+      : retries(2 /* retries */),
+        threads(boost::thread::hardware_concurrency()),
+        timeout(3 /* seconds */),
         user_agent("SAMPIndexer/1.0 (+https://sa-mp.nl/)") {}
 
   ~IndexOptions() = default;
 
   std::string logstash;     // --logstash
+  uint32_t retries;         // --retries
   std::string server_list;  // --server-list
   uint32_t threads;         // --threads, -t
   uint32_t timeout;         // --timeout
@@ -94,7 +96,7 @@ IndexOptions options;
 
 // Queue and vector used for processing the identified ServerEntries.
 std::queue<ServerEntry> server_queue;
-std::unordered_set<ServerEntry, ServerEntryHasher> retry_list;
+std::unordered_map<ServerEntry, uint32_t, ServerEntryHasher> retry_map;
 
 std::vector<ServerEntry> failure_vector;
 std::vector<ServerInfo> result_vector;
@@ -176,6 +178,7 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
   indexer.add_options()
       ("logstash", po::value<std::string>(), "Path to the logstash UNIX pipe (instead of STDOUT)")
       ("quiet,q", "Block all output")
+      ("retries", po::value<uint32_t>(), "Number of retries for servers that do not respond")
       ("server-list", po::value<std::string>()->required(), "URL of the server list to use")
       ("threads,t", po::value<uint32_t>(), "Number of threads to use")
       ("timeout", po::value<uint32_t>(), "Request timeout for an individual server, in seconds")
@@ -196,6 +199,8 @@ bool ParseCommandLine(IndexOptions* options, int argc, const char** argv) {
   if (variables.count("logstash"))
     options->logstash = variables["logstash"].as<std::string>();
 
+  if (variables.count("retries"))
+    options->retries = variables["retries"].as<uint32_t>();
   if (variables.count("server-list"))
     options->server_list = variables["server-list"].as<std::string>();
   if (variables.count("threads"))
@@ -463,8 +468,15 @@ bool ReadValue(std::string* storage, const boost::array<char, 256>& buffer, cons
 
 // -------------------------------------------------------------------------------------------------
 
+enum class QueryResult {
+  SUCCESS,
+
+  TIMEOUT,
+  INVALID_DATA
+};
+
 // Queries the server defined in |info|. Writes the results to |info| as well.
-bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
+QueryResult QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
   unsigned char packet[11];
 
   boost::asio::ip::address_v4 address = boost::asio::ip::address_v4::from_string(info->server.first);
@@ -501,7 +513,7 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
 
     // Send the |packet| to the |endpoint| over the opened |socket|.
     if (socket.raw().send_to(boost::asio::buffer(packet), endpoint) != sizeof(packet))
-      return false;
+      return QueryResult::TIMEOUT;
 
     boost::array<char, 256> receive_buffer;
 
@@ -509,29 +521,32 @@ bool QueryServer(ServerInfo* info, boost::asio::io_service& io_service) {
 
     if (error == boost::asio::error::operation_not_supported ||
         error == boost::asio::error::operation_aborted)
-      return false;  // timed out
+      return QueryResult::TIMEOUT;  // timed out
 
     size_t offset = 11;  // the |packet| that we sent
 
     if (bytes <= offset)
       throw std::runtime_error("Received packet size too short");
 
-    return ReadValue(&info->has_password, receive_buffer, bytes, &offset) &&
-           ReadValue(&info->players, receive_buffer, bytes, &offset) &&
-           ReadValue(&info->max_players, receive_buffer, bytes, &offset) &&
-           ReadValue(&info->hostname, receive_buffer, bytes, &offset) &&
-           ReadValue(&info->gamemode, receive_buffer, bytes, &offset) &&
-           ReadValue(&info->map, receive_buffer, bytes, &offset);
+    if (ReadValue(&info->has_password, receive_buffer, bytes, &offset) &&
+        ReadValue(&info->players, receive_buffer, bytes, &offset) &&
+        ReadValue(&info->max_players, receive_buffer, bytes, &offset) &&
+        ReadValue(&info->hostname, receive_buffer, bytes, &offset) &&
+        ReadValue(&info->gamemode, receive_buffer, bytes, &offset) &&
+        ReadValue(&info->map, receive_buffer, bytes, &offset))
+      return QueryResult::SUCCESS;
+
+    return QueryResult::INVALID_DATA;
 
   } catch (std::exception& e) {
     if (options.verbosity == Verbosity::VERBOSE || options.verbosity == Verbosity::DEBUG) {
       std::lock_guard<std::mutex> guard(verbose_output_mutex);
       std::cerr << "[" << ToDisplay(info->server) << "] ERROR: " << e.what() << std::endl;
     }
-    return false;
+    return QueryResult::INVALID_DATA;
   }
 
-  return true;
+  return QueryResult::SUCCESS;
 }
 
 // Thread responsible for querying servers. It will pick a ServerEntry from the vector of parsed
@@ -562,7 +577,7 @@ void QueryThread() {
       std::cout << "[" << ToDisplay(server) << "] Querying the server..." << std::endl;
     }
 
-    const bool success = QueryServer(&info, io_service);
+    QueryResult result = QueryServer(&info, io_service);
 
     if (options.verbosity == Verbosity::DEBUG) {
       long int delta = lround(monotonicallyIncreasingTime() - begin);
@@ -572,17 +587,25 @@ void QueryThread() {
                 << std::setprecision(2) << delta << "ms" << std::endl;
     }
 
-    if (!success && !retry_list.count(server)) {
-      std::lock_guard<std::mutex> guard(server_queue_mutex);
+    // Retry when they time out. Sometimes this helps.
+    if (result == QueryResult::TIMEOUT) {
+      if (!retry_map.count(server))
+        retry_map[server] = 0;
 
-      retry_list.insert(server);
-      server_queue.push(server);
-      continue;
+      ++retry_map[server]; // 1...
+
+      if (retry_map[server] < options.retries) {
+        std::lock_guard<std::mutex> guard(server_queue_mutex);
+        server_queue.push(server);
+
+        continue;
+      }
     }
 
+    // Otherwise write the server to either the success or failure set.
     {
       std::lock_guard<std::mutex> guard(result_mutex);
-      if (success)
+      if (result == QueryResult::SUCCESS)
         result_vector.push_back(std::move(info));
       else
         failure_vector.push_back(server);
