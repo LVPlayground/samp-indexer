@@ -670,31 +670,25 @@ int main(int argc, const char** argv) {
     boost::asio::local::stream_protocol::socket logstash_socket(logstash_io_service);
 
     try {
-      logstash_socket.connect(boost::asio::local::stream_protocol::endpoint(options.logstash));
+      logstash_socket.connect(boost::asio::local::datagram_protocol::endpoint(options.logstash));
 
-      std::stringstream stream;
-      stream << "[";
-
-      for (size_t i = 0; i < result_vector.size(); ++i) {
-        const ServerInfo& info = result_vector[i];
-
+      for (const ServerInfo& info : result_vector) {
+        std::stringstream stream;
         stream << "{";
         {
-          stream << "\"type\": \"query\",";
-          stream << "\"server\": \"" << info.server.first << ":" << info.server.second << "\",";
-          stream << "\"online\": 1,";
-          stream << "\"players\": " << info.players << ",";
-          stream << "\"max_players\": " << info.max_players;
+          stream << "\"type\":\"query\",";
+          stream << "\"server\":\"" << info.server.first << ":" << info.server.second << "\",";
+          stream << "\"online\":1,";
+          stream << "\"players\":" << info.players << ",";
+          stream << "\"max_players\":" << info.max_players;
         }
         stream << "}";
 
-        if (failure_vector.size() || i < (result_vector.size() - 1))
-          stream << ",";
+        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
       }
 
-      for (size_t i = 0; i < failure_vector.size(); ++i) {
-        const ServerEntry& server = failure_vector[i];
-
+      for (const ServerEntry& server : failure_vector) {
+        std::stringstream stream;
         stream << "{";
         {
           stream << "\"type\": \"query\",";
@@ -705,13 +699,8 @@ int main(int argc, const char** argv) {
         }
         stream << "}";
 
-        if (i < (failure_vector.size() - 1))
-          stream << ",";
+        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
       }
-
-      stream << "]";
-
-      boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
 
     } catch (std::exception& e) {
       if (options.verbosity != Verbosity::QUIET)
