@@ -672,8 +672,11 @@ int main(int argc, const char** argv) {
     try {
       logstash_socket.connect(boost::asio::local::stream_protocol::endpoint(options.logstash));
 
-      for (const ServerInfo& info : result_vector) {
-        std::stringstream stream;
+      std::stringstream stream;
+      stream << "[";
+
+      for (size_t i = 0; i < result_vector.size(); ++i) {
+        const ServerInfo& info = result_vector[i];
 
         stream << "{";
         {
@@ -685,11 +688,12 @@ int main(int argc, const char** argv) {
         }
         stream << "}";
 
-        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
+        if (failure_vector.size() || i < (result_vector.size() - 1))
+          stream << ",";
       }
 
-      for (const ServerEntry& server : failure_vector) {
-        std::stringstream stream;
+      for (size_t i = 0; i < failure_vector.size(); ++i) {
+        const ServerEntry& server = failure_vector[i];
 
         stream << "{";
         {
@@ -701,8 +705,13 @@ int main(int argc, const char** argv) {
         }
         stream << "}";
 
-        boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
+        if (i < (failure_vector.size() - 1))
+          stream << ",";
       }
+
+      stream << "]";
+
+      boost::asio::write(logstash_socket, boost::asio::buffer(stream.str()));
 
     } catch (std::exception& e) {
       if (options.verbosity != Verbosity::QUIET)
